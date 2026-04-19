@@ -23,6 +23,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal", "test-util"] }
 tracing-subscriber = { workspace = true }
+splitter-peer = { path = "../splitter-peer" }
 
 [[example]]
 name = "join"

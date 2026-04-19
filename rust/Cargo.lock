@@ -821,6 +821,7 @@ dependencies = [
  "futures",
  "prost",
  "prost-types",
+ "splitter-peer",
  "splitter-proto",
  "thiserror",
  "tokio",
@@ -830,6 +831,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "splitter-peer"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]

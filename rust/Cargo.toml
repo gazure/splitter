@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "splitter-proto",
     "splitter-client",
+    "splitter-peer",
 ]
 
 [workspace.package]
