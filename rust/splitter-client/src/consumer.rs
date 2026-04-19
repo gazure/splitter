@@ -30,7 +30,7 @@ use crate::ids::{DomainKeyName, GrantId, GrantState, Instance, QualifiedServiceN
 use crate::latch::{Latch, LatchReader};
 use crate::ownership::Ownership;
 use crate::session;
-use crate::wrap::{grant_state_from_i32, system_time_to_timestamp, timestamp_to_system_time};
+use crate::wrap::{grant_state_from_i32, timestamp_to_system_time};
 
 /// User-facing options for `ConsumerClient::join`.
 #[derive(Clone, Debug, Default)]
@@ -326,10 +326,27 @@ impl Driver {
         }
 
         let ownership = Ownership::new(state, expiration);
+        let expired = ownership.expired.reader();
         let helpers = vec![
-            spawn_load_watcher(ownership.clone(), g.clone(), self.outbound.clone()),
-            spawn_unload_watcher(ownership.clone(), g.clone(), self.outbound.clone()),
-            spawn_request_revoke_watcher(ownership.clone(), g.clone(), self.outbound.clone()),
+            spawn_signal_watcher(expired.clone(), ownership.loader.load.reader(), {
+                let g = g.clone();
+                let out = self.outbound.clone();
+                move || send_update(out, g, pb::GrantState::AllocatedLoaded)
+            }),
+            spawn_signal_watcher(expired.clone(), ownership.unloader.unload.reader(), {
+                let g = g.clone();
+                let out = self.outbound.clone();
+                move || send_update(out, g, pb::GrantState::RevokedUnloaded)
+            }),
+            spawn_signal_watcher(
+                expired,
+                ownership.request_revoke_signal.reader(),
+                {
+                    let g = g.clone();
+                    let out = self.outbound.clone();
+                    move || send_revoke(out, g)
+                },
+            ),
             spawn_expiration_timer(ownership.clone()),
         ];
 
@@ -420,75 +437,55 @@ impl Driver {
 
 // ---------- Per-grant watcher tasks ----------
 
-fn spawn_load_watcher(
-    ownership: Arc<Ownership>,
-    grant: pb::Grant,
-    outbound: mpsc::Sender<JoinMessage>,
-) -> TaskHandle<()> {
+/// Race a user-driven `signal` latch against the grant's `expired` latch.
+/// If `signal` fires first, invoke `on_signal` (typically to push an outbound
+/// message); on expiration, exit silently. Used by the three lifecycle
+/// watchers — load, unload, request-revoke — that all share this shape.
+fn spawn_signal_watcher<F, Fut>(
+    expired: LatchReader,
+    signal: LatchReader,
+    on_signal: F,
+) -> TaskHandle<()>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     tokio::spawn(async move {
-        let load = ownership.loader.load.reader();
-        let expired = ownership.expired.reader();
         tokio::select! {
-            _ = load.closed() => {
-                let updated = pb::Grant {
-                    state: pb::GrantState::AllocatedLoaded as i32,
-                    ..grant
-                };
-                let _ = outbound
-                    .send(wrap_client(client_message::Msg::Update(client_message::Update {
-                        grant: Some(updated),
-                    })))
-                    .await;
+            _ = signal.closed() => {
+                on_signal().await;
             }
             _ = expired.closed() => {}
         }
     })
 }
 
-fn spawn_unload_watcher(
-    ownership: Arc<Ownership>,
-    grant: pb::Grant,
+async fn send_update(
     outbound: mpsc::Sender<JoinMessage>,
-) -> TaskHandle<()> {
-    tokio::spawn(async move {
-        let unload = ownership.unloader.unload.reader();
-        let expired = ownership.expired.reader();
-        tokio::select! {
-            _ = unload.closed() => {
-                let updated = pb::Grant {
-                    state: pb::GrantState::RevokedUnloaded as i32,
-                    ..grant
-                };
-                let _ = outbound
-                    .send(wrap_client(client_message::Msg::Update(client_message::Update {
-                        grant: Some(updated),
-                    })))
-                    .await;
-            }
-            _ = expired.closed() => {}
-        }
-    })
+    grant: pb::Grant,
+    state: pb::GrantState,
+) {
+    let updated = pb::Grant {
+        state: state as i32,
+        ..grant
+    };
+    let _ = outbound
+        .send(wrap_client(client_message::Msg::Update(
+            client_message::Update {
+                grant: Some(updated),
+            },
+        )))
+        .await;
 }
 
-fn spawn_request_revoke_watcher(
-    ownership: Arc<Ownership>,
-    grant: pb::Grant,
-    outbound: mpsc::Sender<JoinMessage>,
-) -> TaskHandle<()> {
-    tokio::spawn(async move {
-        let requested = ownership.request_revoke_signal.reader();
-        let expired = ownership.expired.reader();
-        tokio::select! {
-            _ = requested.closed() => {
-                let _ = outbound
-                    .send(wrap_client(client_message::Msg::Revoke(client_message::Revoke {
-                        grants: vec![grant],
-                    })))
-                    .await;
-            }
-            _ = expired.closed() => {}
-        }
-    })
+async fn send_revoke(outbound: mpsc::Sender<JoinMessage>, grant: pb::Grant) {
+    let _ = outbound
+        .send(wrap_client(client_message::Msg::Revoke(
+            client_message::Revoke {
+                grants: vec![grant],
+            },
+        )))
+        .await;
 }
 
 fn spawn_expiration_timer(ownership: Arc<Ownership>) -> TaskHandle<()> {
@@ -552,15 +549,3 @@ fn wrap_client(msg: pb::client_message::Msg) -> JoinMessage {
     }
 }
 
-/// Public test helper: construct a `pb::Grant` from its domain parts. Used by
-/// integration tests and examples that want to fabricate messages for the
-/// mock server path.
-pub fn grant_pb(id: &str, shard: Shard, state: GrantState, lease: SystemTime) -> pb::Grant {
-    pb::Grant {
-        id: id.to_string(),
-        shard: Some(shard.into()),
-        state: pb::GrantState::from(state) as i32,
-        lease: Some(system_time_to_timestamp(lease)),
-        assigned: Some(system_time_to_timestamp(SystemTime::now())),
-    }
-}
