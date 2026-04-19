@@ -331,7 +331,7 @@ mod tests {
                 name: "d".into(),
             },
             kind: DomainType::Global,
-            region: String::new(),
+            region: Default::default(),
             from: String::new(),
             to: String::new(),
         }

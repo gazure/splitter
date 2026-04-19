@@ -51,8 +51,9 @@ pub use dispatcher::{DispatchFilter, Dispatcher, DispatcherBuilder, FilterContex
 pub use error::{ClientError, Result};
 pub use grant_map::GrantMap;
 pub use ids::{
-    ConsumerId, DomainKey, DomainKeyName, DomainType, GrantId, GrantState, Instance, InstanceId,
-    Location, QualifiedDomainKey, QualifiedDomainName, QualifiedServiceName, Shard,
+    ConsumerId, DomainKey, DomainKeyName, DomainName, DomainType, Endpoint, GrantId, GrantState,
+    Instance, InstanceId, InstanceName, Location, NodeName, QualifiedDomainKey,
+    QualifiedDomainName, QualifiedServiceName, Region, ServiceName, Shard, TenantName,
 };
 pub use latch::{Latch, LatchReader};
 pub use ownership::{Loader, Ownership, Unloader};

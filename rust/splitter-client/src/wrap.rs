@@ -13,7 +13,7 @@ use splitter_proto::pb;
 
 use crate::error::ClientError;
 use crate::ids::{
-    DomainKey, DomainKeyName, DomainType, GrantState, Instance, InstanceId, Location,
+    DomainKey, DomainKeyName, DomainType, Endpoint, GrantState, Instance, InstanceId, Location,
     QualifiedDomainKey, QualifiedDomainName, QualifiedServiceName, Shard,
 };
 
@@ -46,8 +46,8 @@ pub fn now_timestamp() -> Timestamp {
 impl From<location_pb::Location> for Location {
     fn from(l: location_pb::Location) -> Self {
         Location {
-            region: l.region,
-            node: l.node,
+            region: l.region.into(),
+            node: l.node.into(),
         }
     }
 }
@@ -55,8 +55,8 @@ impl From<location_pb::Location> for Location {
 impl From<Location> for location_pb::Location {
     fn from(l: Location) -> Self {
         location_pb::Location {
-            region: l.region,
-            node: l.node,
+            region: l.region.into_string(),
+            node: l.node.into_string(),
         }
     }
 }
@@ -65,12 +65,14 @@ impl TryFrom<location_pb::Instance> for Instance {
     type Error = ClientError;
     fn try_from(pb: location_pb::Instance) -> Result<Self, Self::Error> {
         let created = required(pb.created, "location.Instance.created")?;
+        let id = InstanceId::try_from(pb.id.as_str())
+            .map_err(|e| ClientError::InvalidMessage(format!("invalid instance id '{}': {e}", pb.id)))?;
         Ok(Instance {
-            id: InstanceId(pb.id),
+            id,
             location: pb.location.map(Location::from).unwrap_or_default(),
-            name: pb.name,
+            name: pb.name.into(),
             created: timestamp_to_system_time(&created),
-            endpoint: String::new(),
+            endpoint: Endpoint::default(),
         })
     }
 }
@@ -80,7 +82,7 @@ impl TryFrom<pb::Instance> for Instance {
     fn try_from(pb: pb::Instance) -> Result<Self, Self::Error> {
         let inner = required(pb.instance, "Instance.instance")?;
         let mut inst = Instance::try_from(inner)?;
-        inst.endpoint = pb.endpoint;
+        inst.endpoint = pb.endpoint.into();
         Ok(inst)
     }
 }
@@ -88,17 +90,17 @@ impl TryFrom<pb::Instance> for Instance {
 impl From<Instance> for location_pb::Instance {
     fn from(i: Instance) -> Self {
         location_pb::Instance {
-            id: i.id.0,
+            id: i.id.to_string(),
             location: Some(i.location.into()),
             created: Some(system_time_to_timestamp(i.created)),
-            name: i.name,
+            name: i.name.into_string(),
         }
     }
 }
 
 impl From<Instance> for pb::Instance {
     fn from(i: Instance) -> Self {
-        let endpoint = i.endpoint.clone();
+        let endpoint = i.endpoint.clone().into_string();
         pb::Instance {
             instance: Some(i.into()),
             endpoint,
@@ -111,8 +113,8 @@ impl From<Instance> for pb::Instance {
 impl From<pb::QualifiedServiceName> for QualifiedServiceName {
     fn from(p: pb::QualifiedServiceName) -> Self {
         QualifiedServiceName {
-            tenant: p.tenant,
-            service: p.service,
+            tenant: p.tenant.into(),
+            service: p.service.into(),
         }
     }
 }
@@ -120,8 +122,8 @@ impl From<pb::QualifiedServiceName> for QualifiedServiceName {
 impl From<QualifiedServiceName> for pb::QualifiedServiceName {
     fn from(q: QualifiedServiceName) -> Self {
         pb::QualifiedServiceName {
-            tenant: q.tenant,
-            service: q.service,
+            tenant: q.tenant.into_string(),
+            service: q.service.into_string(),
         }
     }
 }
@@ -131,7 +133,7 @@ impl TryFrom<pb::QualifiedDomainName> for QualifiedDomainName {
     fn try_from(p: pb::QualifiedDomainName) -> Result<Self, Self::Error> {
         Ok(QualifiedDomainName {
             service: required(p.service, "QualifiedDomainName.service")?.into(),
-            name: p.name,
+            name: p.name.into(),
         })
     }
 }
@@ -140,7 +142,7 @@ impl From<QualifiedDomainName> for pb::QualifiedDomainName {
     fn from(d: QualifiedDomainName) -> Self {
         pb::QualifiedDomainName {
             service: Some(d.service.into()),
-            name: d.name,
+            name: d.name.into_string(),
         }
     }
 }
@@ -148,7 +150,7 @@ impl From<QualifiedDomainName> for pb::QualifiedDomainName {
 impl From<pb::DomainKey> for DomainKey {
     fn from(p: pb::DomainKey) -> Self {
         DomainKey {
-            region: p.region,
+            region: p.region.into(),
             key: p.key,
         }
     }
@@ -157,7 +159,7 @@ impl From<pb::DomainKey> for DomainKey {
 impl From<DomainKey> for pb::DomainKey {
     fn from(d: DomainKey) -> Self {
         pb::DomainKey {
-            region: d.region,
+            region: d.region.into_string(),
             key: d.key,
         }
     }
@@ -185,7 +187,7 @@ impl From<QualifiedDomainKey> for pb::QualifiedDomainKey {
 impl From<pb::DomainKeyName> for DomainKeyName {
     fn from(p: pb::DomainKeyName) -> Self {
         DomainKeyName {
-            domain: p.domain,
+            domain: p.domain.into(),
             name: p.name,
         }
     }
@@ -194,7 +196,7 @@ impl From<pb::DomainKeyName> for DomainKeyName {
 impl From<DomainKeyName> for pb::DomainKeyName {
     fn from(n: DomainKeyName) -> Self {
         pb::DomainKeyName {
-            domain: n.domain,
+            domain: n.domain.into_string(),
             name: n.name,
         }
     }
@@ -270,7 +272,7 @@ impl TryFrom<pb::Shard> for Shard {
         Ok(Shard {
             domain: required(p.domain, "Shard.domain")?.try_into()?,
             kind: domain_type_from_i32(p.r#type),
-            region: p.region,
+            region: p.region.into(),
             from: p.from,
             to: p.to,
         })
@@ -283,7 +285,7 @@ impl From<Shard> for pb::Shard {
         pb::Shard {
             domain: Some(s.domain.into()),
             r#type: ty as i32,
-            region: s.region,
+            region: s.region.into_string(),
             from: s.from,
             to: s.to,
         }

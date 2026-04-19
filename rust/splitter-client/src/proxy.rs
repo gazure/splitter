@@ -163,7 +163,7 @@ mod tests {
                     name: "d".into(),
                 },
                 key: DomainKey {
-                    region: String::new(),
+                    region: Default::default(),
                     key: key.to_string(),
                 },
             }

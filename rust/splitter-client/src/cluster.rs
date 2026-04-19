@@ -132,7 +132,12 @@ impl ClusterMap {
 
         if let Some(remove) = change.remove {
             for cid in remove.consumers {
-                remove_consumer(&mut next, &InstanceId(cid));
+                match InstanceId::try_from(cid.as_str()) {
+                    Ok(id) => remove_consumer(&mut next, &id),
+                    Err(e) => {
+                        tracing::warn!(%cid, error = %e, "ignoring invalid consumer id in Remove");
+                    }
+                }
             }
         }
 
@@ -203,11 +208,11 @@ fn apply_assignment(
         .consumer
         .ok_or_else(|| ClientError::InvalidMessage("Assignment without consumer".into()))?;
     let consumer = Instance::try_from(consumer_pb)?;
-    let cid = consumer.id.clone();
+    let cid = consumer.id;
 
     let entry = map
         .consumers
-        .entry(cid.clone())
+        .entry(cid)
         .or_insert_with(|| ConsumerEntry {
             consumer,
             grants: Vec::new(),
@@ -227,7 +232,7 @@ fn apply_assignment(
                 id: gid,
                 shard,
                 state,
-                consumer: cid.clone(),
+                consumer: cid,
             },
         );
     }
