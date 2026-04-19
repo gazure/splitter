@@ -16,22 +16,22 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tracing::warn;
 
 use crate::cluster::ClusterMap;
 use crate::error::ClientError;
-use crate::ids::InstanceId;
+use crate::ids::{Endpoint, InstanceId};
 
 struct PoolEntry {
-    endpoint: String,
+    endpoint: Endpoint,
     channel: Channel,
 }
 
-/// Dial configuration: accepts a "host:port" or full URL and returns a tonic
-/// [`Channel`]. Defaults to insecure HTTP/2. Users can customize via
-/// [`ConnectionPool::with_tls`].
-type DialFn = dyn Fn(&str) -> Result<Channel, ClientError> + Send + Sync + 'static;
+/// Dial configuration: accepts an [`Endpoint`] (host:port or full URL) and
+/// returns a tonic [`Channel`]. Defaults to insecure HTTP/2. Users can
+/// customize via [`ConnectionPool::with_dial`].
+type DialFn = dyn Fn(&Endpoint) -> Result<Channel, ClientError> + Send + Sync + 'static;
 
 pub struct ConnectionPool {
     self_id: InstanceId,
@@ -52,7 +52,7 @@ impl ConnectionPool {
     /// custom interceptors; the default dials insecure HTTP/2.
     pub fn with_dial<F>(self_id: InstanceId, dial: F) -> Arc<Self>
     where
-        F: Fn(&str) -> Result<Channel, ClientError> + Send + Sync + 'static,
+        F: Fn(&Endpoint) -> Result<Channel, ClientError> + Send + Sync + 'static,
     {
         Arc::new(Self {
             self_id,
@@ -81,13 +81,13 @@ impl ConnectionPool {
     /// ones, rebuild channels whose advertised endpoint has changed.
     pub fn apply_cluster(&self, cluster: &ClusterMap) {
         let mut seen: HashSet<InstanceId> = HashSet::new();
-        let mut to_add: Vec<(InstanceId, String)> = Vec::new();
-        let mut to_rebuild: Vec<(InstanceId, String)> = Vec::new();
+        let mut to_add: Vec<(InstanceId, Endpoint)> = Vec::new();
+        let mut to_rebuild: Vec<(InstanceId, Endpoint)> = Vec::new();
 
         {
             let entries = self.entries.read().expect("pool poisoned");
             for consumer in cluster.consumers.values() {
-                let id = consumer.consumer.id.clone();
+                let id = consumer.consumer.id;
                 if id == self.self_id {
                     continue;
                 }
@@ -95,7 +95,7 @@ impl ConnectionPool {
                 if endpoint.is_empty() {
                     continue; // peer didn't advertise a server; skip silently
                 }
-                seen.insert(id.clone());
+                seen.insert(id);
                 match entries.get(&id) {
                     Some(existing) if existing.endpoint == endpoint => {}
                     Some(_) => to_rebuild.push((id, endpoint)),
@@ -134,8 +134,8 @@ impl ConnectionPool {
     }
 }
 
-fn default_dial(endpoint: &str) -> Result<Channel, ClientError> {
-    Endpoint::from_shared(normalize_endpoint(endpoint))
+fn default_dial(endpoint: &Endpoint) -> Result<Channel, ClientError> {
+    tonic::transport::Endpoint::from_shared(normalize_endpoint(endpoint.as_str()))
         .map(|ep| ep.connect_lazy())
         .map_err(ClientError::TransportSetup)
 }
@@ -157,11 +157,18 @@ mod tests {
     use crate::ids::Location;
     use std::time::SystemTime;
 
-    fn mk_instance(id: &str, endpoint: &str) -> crate::ids::Instance {
+    /// Deterministic test IDs from a u128 so we can refer to them by short
+    /// labels without generating random UUIDs.
+    const ME: InstanceId = InstanceId(uuid::Uuid::from_u128(0x0000_0000_0000_0001));
+    const OTHER: InstanceId = InstanceId(uuid::Uuid::from_u128(0x0000_0000_0000_0002));
+    const PEER_A: InstanceId = InstanceId(uuid::Uuid::from_u128(0x0000_0000_0000_000A));
+    const PEER_B: InstanceId = InstanceId(uuid::Uuid::from_u128(0x0000_0000_0000_000B));
+
+    fn mk_instance(id: InstanceId, endpoint: &str) -> crate::ids::Instance {
         crate::ids::Instance {
-            id: InstanceId(id.into()),
+            id,
             location: Location::default(),
-            name: id.into(),
+            name: "test".into(),
             created: SystemTime::UNIX_EPOCH,
             endpoint: endpoint.into(),
         }
@@ -171,7 +178,7 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         for c in consumers {
             map.insert(
-                c.id.clone(),
+                c.id,
                 ConsumerEntry {
                     consumer: c,
                     grants: Vec::new(),
@@ -192,63 +199,57 @@ mod tests {
 
     #[test]
     fn self_resolve_returns_no_resolution() {
-        let pool = ConnectionPool::new(InstanceId("me".into()));
-        assert!(matches!(
-            pool.resolve(&InstanceId("me".into())),
-            Err(ClientError::NoResolution)
-        ));
+        let pool = ConnectionPool::new(ME);
+        assert!(matches!(pool.resolve(&ME), Err(ClientError::NoResolution)));
     }
 
     #[test]
     fn unknown_id_returns_no_resolution() {
-        let pool = ConnectionPool::new(InstanceId("me".into()));
+        let pool = ConnectionPool::new(ME);
         assert!(matches!(
-            pool.resolve(&InstanceId("other".into())),
+            pool.resolve(&OTHER),
             Err(ClientError::NoResolution)
         ));
     }
 
     #[tokio::test]
     async fn apply_cluster_adds_known_peers() {
-        let pool = ConnectionPool::new(InstanceId("me".into()));
+        let pool = ConnectionPool::new(ME);
         let cluster = mk_cluster(vec![
-            mk_instance("me", "1.1.1.1:50052"),
-            mk_instance("peer-a", "2.2.2.2:50052"),
-            mk_instance("peer-b", "3.3.3.3:50052"),
+            mk_instance(ME, "1.1.1.1:50052"),
+            mk_instance(PEER_A, "2.2.2.2:50052"),
+            mk_instance(PEER_B, "3.3.3.3:50052"),
         ]);
         pool.apply_cluster(&cluster);
         assert_eq!(pool.len(), 2);
-        assert!(pool.resolve(&InstanceId("peer-a".into())).is_ok());
-        assert!(pool.resolve(&InstanceId("peer-b".into())).is_ok());
+        assert!(pool.resolve(&PEER_A).is_ok());
+        assert!(pool.resolve(&PEER_B).is_ok());
         // self still rejects
-        assert!(matches!(
-            pool.resolve(&InstanceId("me".into())),
-            Err(ClientError::NoResolution)
-        ));
+        assert!(matches!(pool.resolve(&ME), Err(ClientError::NoResolution)));
     }
 
     #[tokio::test]
     async fn apply_cluster_drops_departed_peers() {
-        let pool = ConnectionPool::new(InstanceId("me".into()));
+        let pool = ConnectionPool::new(ME);
         pool.apply_cluster(&mk_cluster(vec![
-            mk_instance("peer-a", "2.2.2.2:50052"),
-            mk_instance("peer-b", "3.3.3.3:50052"),
+            mk_instance(PEER_A, "2.2.2.2:50052"),
+            mk_instance(PEER_B, "3.3.3.3:50052"),
         ]));
         assert_eq!(pool.len(), 2);
 
-        pool.apply_cluster(&mk_cluster(vec![mk_instance("peer-a", "2.2.2.2:50052")]));
+        pool.apply_cluster(&mk_cluster(vec![mk_instance(PEER_A, "2.2.2.2:50052")]));
         assert_eq!(pool.len(), 1);
-        assert!(pool.resolve(&InstanceId("peer-a".into())).is_ok());
+        assert!(pool.resolve(&PEER_A).is_ok());
         assert!(matches!(
-            pool.resolve(&InstanceId("peer-b".into())),
+            pool.resolve(&PEER_B),
             Err(ClientError::NoResolution)
         ));
     }
 
     #[tokio::test]
     async fn apply_cluster_skips_empty_endpoints() {
-        let pool = ConnectionPool::new(InstanceId("me".into()));
-        pool.apply_cluster(&mk_cluster(vec![mk_instance("peer-a", "")]));
+        let pool = ConnectionPool::new(ME);
+        pool.apply_cluster(&mk_cluster(vec![mk_instance(PEER_A, "")]));
         assert_eq!(pool.len(), 0);
     }
 }

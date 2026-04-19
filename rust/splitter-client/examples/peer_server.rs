@@ -73,11 +73,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- 2. Connect to the coordinator and build the Dispatcher ---
     let channel = Channel::from_shared(endpoint.clone())?.connect().await?;
     let instance = Instance {
-        id: InstanceId(uuid::Uuid::new_v4().to_string()),
+        id: InstanceId::new(),
         location: Location::new(region, node),
         name: "splitter-rs/peer-example".into(),
         created: SystemTime::now(),
-        endpoint: peer.endpoint.clone(),
+        endpoint: peer.endpoint.clone().into(),
     };
 
     let log = Arc::new(Mutex::new(Vec::new()));

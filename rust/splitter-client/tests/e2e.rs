@@ -25,7 +25,7 @@
 use std::time::{Duration, SystemTime};
 
 use splitter_client::{
-    ConsumerClient, ConsumerOptions, Instance, InstanceId, Location, QualifiedServiceName,
+    ConsumerClient, ConsumerOptions, Endpoint, Instance, InstanceId, Location, QualifiedServiceName
 };
 use tonic::transport::Channel;
 
@@ -43,11 +43,11 @@ fn read_env() -> Option<Env> {
 
 fn test_instance() -> Instance {
     Instance {
-        id: InstanceId(uuid::Uuid::new_v4().to_string()),
+        id: InstanceId::new(),
         location: Location::new("local", "test"),
         name: "splitter-rs-e2e".into(),
         created: SystemTime::now(),
-        endpoint: String::new(),
+        endpoint: Endpoint::default(),
     }
 }
 

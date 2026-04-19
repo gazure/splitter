@@ -47,11 +47,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = ConsumerClient::new(channel);
 
     let consumer = Instance {
-        id: InstanceId(uuid::Uuid::new_v4().to_string()),
+        id: InstanceId::new(),
         location: Location::new(region, node),
-        name: "splitter-rs/join-example".to_string(),
+        name: "splitter-rs/join-example".into(),
         created: SystemTime::now(),
-        endpoint: String::new(),
+        endpoint: Default::default(),
     };
 
     let handle = client

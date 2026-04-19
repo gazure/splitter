@@ -56,11 +56,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let channel = Channel::from_shared(endpoint)?.connect().await?;
     let instance = Instance {
-        id: InstanceId(uuid::Uuid::new_v4().to_string()),
+        id: InstanceId::new(),
         location: Location::new(region, node),
         name: "splitter-rs/processor-example".into(),
         created: SystemTime::now(),
-        endpoint: String::new(),
+        endpoint: Default::default(),
     };
 
     let log = Arc::new(Mutex::new(Vec::new()));

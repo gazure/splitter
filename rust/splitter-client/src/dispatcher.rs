@@ -87,7 +87,7 @@ impl DispatcherBuilder {
 
         let pool = self
             .pool
-            .unwrap_or_else(|| ConnectionPool::new(self.instance.id.clone()));
+            .unwrap_or_else(|| ConnectionPool::new(self.instance.id));
 
         // Seed pool with current cluster, then keep it in sync.
         pool.apply_cluster(&join.cluster.borrow().clone());
