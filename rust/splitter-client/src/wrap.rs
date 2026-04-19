@@ -13,7 +13,7 @@ use splitter_proto::pb;
 
 use crate::error::ClientError;
 use crate::ids::{
-    DomainKey, DomainKeyName, DomainType, GrantId, GrantState, Instance, InstanceId, Location,
+    DomainKey, DomainKeyName, DomainType, GrantState, Instance, InstanceId, Location,
     QualifiedDomainKey, QualifiedDomainName, QualifiedServiceName, Shard,
 };
 
@@ -224,7 +224,7 @@ impl From<DomainType> for pb::DomainType {
     }
 }
 
-pub fn domain_type_from_i32(v: i32) -> DomainType {
+fn domain_type_from_i32(v: i32) -> DomainType {
     pb::DomainType::try_from(v)
         .unwrap_or(pb::DomainType::Invalid)
         .into()
@@ -290,6 +290,3 @@ impl From<Shard> for pb::Shard {
     }
 }
 
-pub fn wrap_grant_id(s: String) -> GrantId {
-    GrantId(s)
-}

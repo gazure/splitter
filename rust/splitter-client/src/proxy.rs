@@ -105,40 +105,9 @@ where
     LFut: Future<Output = Result<Resp>>,
 {
     let backoff = OwnershipBackoff::new(timeout);
-    retry_ownership(&backoff, || async {
-        do_handle(proxy, key, req.clone(), &remote, &local).await
-    })
-    .await
-}
-
-/// Interior routing helper with `Fn` closures, shared by `handle_with_retry`.
-async fn do_handle<P, Req, Resp, Rem, Loc, RFut, LFut>(
-    proxy: &P,
-    key: &P::Key,
-    req: Req,
-    remote: &Rem,
-    local: &Loc,
-) -> Result<Resp>
-where
-    P: Proxy,
-    Rem: Fn(P::Client, Req) -> RFut,
-    Loc: Fn(P::Value, Req) -> LFut,
-    RFut: Future<Output = core::result::Result<Resp, tonic::Status>>,
-    LFut: Future<Output = Result<Resp>>,
-{
-    if let Some(v) = proxy.lookup(key, &[GrantState::Active]) {
-        return local(v, req).await;
-    }
-    match proxy.resolve(key) {
-        Ok(client) => remote(client, req).await.map_err(ClientError::from_grpc),
-        Err(ClientError::NoResolution) => {
-            if let Some(v) = proxy.lookup(key, &[]) {
-                return local(v, req).await;
-            }
-            Err(ClientError::NotOwned)
-        }
-        Err(e) => Err(e),
-    }
+    // &remote / &local each satisfy FnOnce via the blanket `&F: Fn` impl,
+    // so one `handle` call per attempt consumes nothing of the outer closures.
+    retry_ownership(&backoff, || handle(proxy, key, req.clone(), &remote, &local)).await
 }
 
 #[cfg(test)]
