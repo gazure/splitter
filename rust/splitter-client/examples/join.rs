@@ -1,19 +1,24 @@
-//! Phase-1 smoke test: connect to a splitter, join a service, print cluster
-//! updates and grant-related messages until Ctrl-C.
+//! Phase-2 smoke: connect to a splitter, join a service, and drive the
+//! ownership lifecycle for each assigned grant.
+//!
+//! For every grant we receive, we spawn a task that:
+//!   1. waits for counterpart unload, then calls `loader.load()`
+//!   2. waits for activation
+//!   3. waits for revocation, then calls `unloader.unload()`
+//!   4. waits for counterpart load
+//!
+//! This is a minimal but complete lifecycle driver — Phase 3's `Processor`
+//! generalizes this over a user-supplied `Range`.
 //!
 //! Usage:
 //!     cargo run --example join -- <endpoint> <tenant/service> [region] [node]
-//!
-//! Defaults:
-//!     endpoint: http://localhost:50051
-//!     tenant/service: (required)
-//!     region:   local
-//!     node:     local
 
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use splitter_client::{
-    ConsumerClient, ConsumerOptions, Instance, InstanceId, Location, QualifiedServiceName,
+    ConsumerClient, ConsumerOptions, GrantEvent, GrantId, Instance, InstanceId, Location,
+    Ownership, QualifiedServiceName, Shard,
 };
 use tonic::transport::Channel;
 
@@ -30,9 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = args
         .next()
         .unwrap_or_else(|| "http://localhost:50051".to_string());
-    let svc_arg = args
-        .next()
-        .ok_or("second arg must be tenant/service")?;
+    let svc_arg = args.next().ok_or("second arg must be tenant/service")?;
     let service = QualifiedServiceName::parse(&svc_arg)
         .ok_or("tenant/service format required, e.g. acme/widgets")?;
     let region = args.next().unwrap_or_else(|| "local".to_string());
@@ -62,10 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             res = cluster.changed() => {
-                if res.is_err() {
-                    tracing::info!("cluster channel closed");
-                    break;
-                }
+                if res.is_err() { break; }
                 let snap = cluster.borrow_and_update();
                 tracing::info!(
                     version = snap.id.version,
@@ -77,7 +77,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             evt = grants.recv() => {
                 match evt {
-                    Ok(e) => tracing::info!("grant event: {:?}", kind_name(&e)),
+                    Ok(GrantEvent::Assigned { id, shard, ownership }) => {
+                        tracing::info!(grant = %id, shard = %shard, expiration = ?ownership.expiration(), "grant assigned");
+                        tokio::spawn(run_lifecycle(id, shard, ownership));
+                    }
+                    Ok(GrantEvent::Removed { id }) => {
+                        tracing::info!(grant = %id, "grant removed");
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(dropped = n, "grant broadcast lagged");
                     }
@@ -99,17 +105,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn kind_name(e: &splitter_client::ClientMessageEvent) -> &'static str {
-    use splitter_client::ClientMessageEvent::*;
-    match e {
-        Assign(_) => "Assign",
-        Promote(_) => "Promote",
-        Revoke(_) => "Revoke",
-        Released(_) => "Released",
-        Update(_) => "Update",
-        Notify(_) => "Notify",
-        Extend(_) => "Extend",
-        Deregister(_) => "Deregister",
-        Register(_) => "Register",
+async fn run_lifecycle(id: GrantId, shard: Shard, o: Arc<Ownership>) {
+    let loader = match o.wait_for_unload().await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(%id, error = %e, "wait_for_unload bailed");
+            return;
+        }
+    };
+    tracing::info!(%id, shard = %shard, "counterpart unloaded, signalling load");
+    loader.load();
+
+    if let Err(e) = o.wait_for_active().await {
+        tracing::warn!(%id, error = %e, "wait_for_active bailed");
+        return;
     }
+    tracing::info!(%id, shard = %shard, "ACTIVE");
+
+    let unloader = match o.wait_for_revoke().await {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(%id, error = %e, "wait_for_revoke bailed");
+            return;
+        }
+    };
+    tracing::info!(%id, shard = %shard, "revoked, draining");
+    unloader.unload();
+
+    if let Err(e) = o.wait_for_load().await {
+        tracing::warn!(%id, error = %e, "wait_for_load bailed");
+        return;
+    }
+    tracing::info!(%id, shard = %shard, "counterpart loaded, exiting");
 }
