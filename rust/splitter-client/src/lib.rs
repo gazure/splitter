@@ -7,16 +7,21 @@
 
 pub mod cluster;
 pub mod consumer;
+pub mod dispatcher;
 pub mod error;
 pub mod grant_map;
 pub mod ids;
 pub mod latch;
 pub mod ownership;
+pub mod pool;
+pub mod processor;
+pub mod resolver;
 pub mod session;
 pub mod wrap;
 
 pub use cluster::{ClusterId, ClusterMap, ConsumerEntry, GrantEntry};
 pub use consumer::{ConsumerClient, ConsumerOptions, GrantEvent, JoinHandle};
+pub use dispatcher::{DispatchFilter, Dispatcher, DispatcherBuilder, FilterContext};
 pub use error::{ClientError, Result};
 pub use grant_map::GrantMap;
 pub use ids::{
@@ -25,3 +30,6 @@ pub use ids::{
 };
 pub use latch::{Latch, LatchReader};
 pub use ownership::{Loader, Ownership, Unloader};
+pub use pool::ConnectionPool;
+pub use processor::{Processor, Range, RangeFactory, RecordingRange};
+pub use resolver::{DomainResolver, RemoteFn};
