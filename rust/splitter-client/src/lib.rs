@@ -15,7 +15,9 @@ pub mod latch;
 pub mod ownership;
 pub mod pool;
 pub mod processor;
+pub mod proxy;
 pub mod resolver;
+pub mod retry;
 pub mod session;
 pub mod wrap;
 
@@ -32,4 +34,6 @@ pub use latch::{Latch, LatchReader};
 pub use ownership::{Loader, Ownership, Unloader};
 pub use pool::ConnectionPool;
 pub use processor::{Processor, Range, RangeFactory, RecordingRange};
+pub use proxy::{handle, handle_with_retry, Proxy};
 pub use resolver::{DomainResolver, RemoteFn};
+pub use retry::{retry_ownership, OwnershipBackoff};
