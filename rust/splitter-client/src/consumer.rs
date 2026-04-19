@@ -1,10 +1,14 @@
-//! Consumer client: drives the `ConsumerService.Join` bidi stream.
+//! Consumer client: drives the `ConsumerService.Join` bidi stream and owns the
+//! per-grant `Ownership` state machine.
 //!
-//! Phase-1 scope: open the stream, drive the embedded session protocol, send
-//! `Register`, surface inbound cluster updates via a `watch` channel and
-//! inbound grant-related `ClientMessage`s via a `broadcast` channel. The
-//! full grant/ownership state machine lives in Phase 2.
+//! On each inbound `ClientMessage` the driver mutates its grant table and
+//! closes the appropriate `Ownership` latches, then broadcasts a
+//! [`GrantEvent`] to downstream consumers (the Dispatcher in Phase 3 or the
+//! example in Phase 1/2). User-side signal latches (`loader.load`,
+//! `unloader.unload`, `request_revoke`) are observed by small per-grant
+//! watcher tasks that turn them into outbound `ClientMessage`s.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -22,9 +26,11 @@ use tracing::{debug, info, warn};
 
 use crate::cluster::ClusterMap;
 use crate::error::{ClientError, Result};
-use crate::ids::{DomainKeyName, Instance, QualifiedServiceName};
+use crate::ids::{DomainKeyName, GrantId, GrantState, Instance, QualifiedServiceName, Shard};
 use crate::latch::{Latch, LatchReader};
+use crate::ownership::Ownership;
 use crate::session;
+use crate::wrap::{grant_state_from_i32, system_time_to_timestamp, timestamp_to_system_time};
 
 /// User-facing options for `ConsumerClient::join`.
 #[derive(Clone, Debug, Default)]
@@ -44,25 +50,23 @@ impl ConsumerOptions {
     }
 }
 
-/// A single decoded inbound `ClientMessage` variant, surfaced to the Dispatcher
-/// layer in Phase 2 and to the `join` example in Phase 1.
+/// Emitted to broadcast subscribers whenever the grant table changes.
 #[derive(Clone, Debug)]
-pub enum ClientMessageEvent {
-    Assign(pb::client_message::Assign),
-    Promote(pb::client_message::Promote),
-    Revoke(pb::client_message::Revoke),
-    Released(pb::client_message::Released),
-    Update(pb::client_message::Update),
-    Notify(pb::client_message::Notify),
-    Extend(pb::client_message::Extend),
-    Deregister(pb::client_message::Deregister),
-    Register(pb::client_message::Register),
+pub enum GrantEvent {
+    Assigned {
+        id: GrantId,
+        shard: Shard,
+        ownership: Arc<Ownership>,
+    },
+    Removed {
+        id: GrantId,
+    },
 }
 
 /// Handle to a running Join stream.
 pub struct JoinHandle {
     pub cluster: watch::Receiver<Arc<ClusterMap>>,
-    pub grants: broadcast::Receiver<ClientMessageEvent>,
+    pub grants: broadcast::Receiver<GrantEvent>,
     closed: LatchReader,
     shutdown: Latch,
     task: Option<TaskHandle<Result<()>>>,
@@ -73,8 +77,12 @@ impl JoinHandle {
         self.closed.clone()
     }
 
+    /// Subscribe a new receiver to grant events.
+    pub fn subscribe_grants(&self) -> broadcast::Receiver<GrantEvent> {
+        self.grants.resubscribe()
+    }
+
     /// Signal the driver to send Deregister + session Closed and exit.
-    /// Returns once the task has exited.
     pub async fn shutdown(mut self) -> Result<()> {
         self.shutdown.close();
         if let Some(task) = self.task.take() {
@@ -87,14 +95,8 @@ impl JoinHandle {
             Ok(())
         }
     }
-
-    /// Subscribe a new receiver to grant-related inbound messages.
-    pub fn subscribe_grants(&self) -> broadcast::Receiver<ClientMessageEvent> {
-        self.grants.resubscribe()
-    }
 }
 
-/// Thin wrapper around the generated tonic `ConsumerServiceClient`.
 #[derive(Clone)]
 pub struct ConsumerClient {
     inner: ConsumerServiceClient<Channel>,
@@ -107,8 +109,7 @@ impl ConsumerClient {
         }
     }
 
-    /// Start a Join stream. Returns a `JoinHandle` whose channels surface
-    /// cluster updates and grant-related messages.
+    /// Start a Join stream.
     pub async fn join(
         &self,
         consumer: Instance,
@@ -117,18 +118,15 @@ impl ConsumerClient {
     ) -> Result<JoinHandle> {
         let (outbound_tx, outbound_rx) = mpsc::channel::<JoinMessage>(64);
         let (cluster_tx, cluster_rx) = watch::channel(Arc::new(ClusterMap::empty()));
-        let (grants_tx, grants_rx) = broadcast::channel::<ClientMessageEvent>(128);
+        let (grants_tx, grants_rx) = broadcast::channel::<GrantEvent>(256);
         let closed = Latch::new();
         let shutdown = Latch::new();
 
-        // Kick off the bidi stream. tonic owns the outbound half via the stream
-        // we give it; we keep the receiver side to pump inbound frames.
         let request_stream = ReceiverStream::new(outbound_rx);
         let mut client = self.inner.clone();
         let response = client.join(request_stream).await?;
         let inbound: Streaming<JoinMessage> = response.into_inner();
 
-        // Send Establish as the first frame so the server can set up the session.
         let session_id = uuid::Uuid::new_v4().to_string();
         outbound_tx
             .send(session::establish_frame(
@@ -138,7 +136,6 @@ impl ConsumerClient {
             .await
             .map_err(|_| ClientError::SessionClosed("outbound closed before Establish".into()))?;
 
-        // Followed by Register so we appear in the assignment rotation.
         outbound_tx
             .send(build_register(consumer.clone(), service.clone(), &opts))
             .await
@@ -148,9 +145,10 @@ impl ConsumerClient {
             outbound: outbound_tx,
             inbound,
             cluster: cluster_tx,
-            grants: grants_tx,
+            grants_tx,
             closed: closed.clone(),
             shutdown: shutdown.clone(),
+            grants: HashMap::new(),
         };
 
         let task = tokio::spawn(driver.run());
@@ -165,28 +163,39 @@ impl ConsumerClient {
     }
 }
 
+struct ActiveGrant {
+    pb_grant: pb::Grant,
+    ownership: Arc<Ownership>,
+    /// Whether the coordinator has asked us to revoke this grant. Tracked so
+    /// Extend only refreshes non-revoked grants (matches `workpool.go:186`).
+    revoked: bool,
+    /// Background helper tasks (load/unload/request_revoke watchers, expiration
+    /// timer). Aborted when the grant is removed.
+    helpers: Vec<TaskHandle<()>>,
+}
+
 struct Driver {
     outbound: mpsc::Sender<JoinMessage>,
     inbound: Streaming<JoinMessage>,
     cluster: watch::Sender<Arc<ClusterMap>>,
-    grants: broadcast::Sender<ClientMessageEvent>,
+    grants_tx: broadcast::Sender<GrantEvent>,
     closed: Latch,
     shutdown: Latch,
+    grants: HashMap<GrantId, ActiveGrant>,
 }
 
 impl Driver {
     async fn run(mut self) -> Result<()> {
-        // Start with a long delay; first Established frame replaces it.
         let mut heartbeat = tokio::time::interval(Duration::from_secs(60));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Skip the immediate first tick — we want the server to drive pacing.
         heartbeat.tick().await;
 
         let result = loop {
             tokio::select! {
-                // Shutdown requested: send Deregister + Closed, then drain.
                 _ = self.shutdown.closed(), if !self.shutdown.is_closed() => {
-                    let _ = self.outbound.send(build_deregister()).await;
+                    let _ = self.outbound.send(wrap_client(client_message::Msg::Deregister(
+                        client_message::Deregister {},
+                    ))).await;
                     let _ = self.outbound.send(session::closed_frame("client shutdown")).await;
                     break Ok(());
                 }
@@ -198,31 +207,29 @@ impl Driver {
                 msg = self.inbound.next() => {
                     match msg {
                         Some(Ok(join)) => {
-                            if let Some(next) = self.handle_inbound(join).await? {
-                                let delay = session::heartbeat_delay(next, SystemTime::now());
+                            if let Some(ttl) = self.handle_inbound(join).await? {
+                                let delay = session::heartbeat_delay(ttl, SystemTime::now());
                                 heartbeat = tokio::time::interval(delay);
                                 heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                                // Consume the immediate tick.
                                 heartbeat.tick().await;
                             }
                         }
-                        Some(Err(status)) => {
-                            break Err(ClientError::Transport(status));
-                        }
-                        None => {
-                            break Err(ClientError::SessionClosed("stream ended".into()));
-                        }
+                        Some(Err(status)) => break Err(ClientError::Transport(status)),
+                        None => break Err(ClientError::SessionClosed("stream ended".into())),
                     }
                 }
             }
         };
 
+        // Clean up all grants on exit.
+        let ids: Vec<GrantId> = self.grants.keys().cloned().collect();
+        for id in ids {
+            self.remove_grant(id);
+        }
         self.closed.close();
         result
     }
 
-    /// Dispatch an inbound frame. Returns a new TTL if a session frame reset
-    /// the heartbeat cadence.
     async fn handle_inbound(&mut self, join: JoinMessage) -> Result<Option<SystemTime>> {
         let Some(msg) = join.msg else {
             return Ok(None);
@@ -247,23 +254,17 @@ impl Driver {
             join_message::Msg::Consumer(ConsumerMessage { msg: Some(sub) }) => {
                 match sub {
                     consumer_message::Msg::Cluster(cm) => {
-                        // Apply the cluster update on top of the current snapshot.
                         let current = self.cluster.borrow().clone();
                         match current.apply(cm) {
                             Ok(next) => {
-                                // watch::Sender::send_if_modified would require PartialEq; we just replace.
                                 let _ = self.cluster.send(Arc::new(next));
                             }
-                            Err(e) => {
-                                warn!(error = %e, "failed to apply cluster update, continuing with previous snapshot");
-                            }
+                            Err(e) => warn!(error = %e, "failed to apply cluster update"),
                         }
                         Ok(None)
                     }
                     consumer_message::Msg::Client(client) => {
-                        if let Some(event) = decode_client_message(client) {
-                            let _ = self.grants.send(event);
-                        }
+                        self.handle_client_message(client).await;
                         Ok(None)
                     }
                 }
@@ -271,21 +272,257 @@ impl Driver {
             join_message::Msg::Consumer(ConsumerMessage { msg: None }) => Ok(None),
         }
     }
-}
 
-fn decode_client_message(msg: ClientMessage) -> Option<ClientMessageEvent> {
-    match msg.msg? {
-        client_message::Msg::Register(r) => Some(ClientMessageEvent::Register(r)),
-        client_message::Msg::Deregister(d) => Some(ClientMessageEvent::Deregister(d)),
-        client_message::Msg::Extend(e) => Some(ClientMessageEvent::Extend(e)),
-        client_message::Msg::Assign(a) => Some(ClientMessageEvent::Assign(a)),
-        client_message::Msg::Promote(p) => Some(ClientMessageEvent::Promote(p)),
-        client_message::Msg::Revoke(r) => Some(ClientMessageEvent::Revoke(r)),
-        client_message::Msg::Released(r) => Some(ClientMessageEvent::Released(r)),
-        client_message::Msg::Update(u) => Some(ClientMessageEvent::Update(u)),
-        client_message::Msg::Notify(n) => Some(ClientMessageEvent::Notify(n)),
+    async fn handle_client_message(&mut self, msg: ClientMessage) {
+        let Some(variant) = msg.msg else { return };
+        match variant {
+            client_message::Msg::Assign(a) => {
+                for g in a.grants {
+                    self.on_assign(g);
+                }
+            }
+            client_message::Msg::Promote(p) => {
+                for g in p.grants {
+                    self.on_promote(g);
+                }
+            }
+            client_message::Msg::Revoke(r) => {
+                for g in r.grants {
+                    self.on_revoke(g);
+                }
+            }
+            client_message::Msg::Notify(n) => {
+                self.on_notify(n);
+            }
+            client_message::Msg::Extend(e) => {
+                self.on_extend(e);
+            }
+            // Coordinator-only; ignore if ever seen on the inbound side.
+            client_message::Msg::Register(_)
+            | client_message::Msg::Deregister(_)
+            | client_message::Msg::Released(_)
+            | client_message::Msg::Update(_) => {}
+        }
+    }
+
+    fn on_assign(&mut self, g: pb::Grant) {
+        let Some(shard) = g.shard.clone().and_then(|s| Shard::try_from(s).ok()) else {
+            warn!(id = %g.id, "Assign with missing/invalid shard");
+            return;
+        };
+        let id = GrantId(g.id.clone());
+        let state = grant_state_from_i32(g.state);
+        let expiration = g
+            .lease
+            .as_ref()
+            .map(timestamp_to_system_time)
+            .unwrap_or_else(|| SystemTime::now() + Duration::from_secs(30));
+
+        // If re-assigning an existing grant (reconnect replay) drop the old
+        // entry entirely — v1 has no reconnect, but the server may still send
+        // duplicates which we should handle idempotently.
+        if self.grants.contains_key(&id) {
+            self.remove_grant(id.clone());
+        }
+
+        let ownership = Ownership::new(state, expiration);
+        let helpers = vec![
+            spawn_load_watcher(ownership.clone(), g.clone(), self.outbound.clone()),
+            spawn_unload_watcher(ownership.clone(), g.clone(), self.outbound.clone()),
+            spawn_request_revoke_watcher(ownership.clone(), g.clone(), self.outbound.clone()),
+            spawn_expiration_timer(ownership.clone()),
+        ];
+
+        self.grants.insert(
+            id.clone(),
+            ActiveGrant {
+                pb_grant: g,
+                ownership: ownership.clone(),
+                revoked: matches!(
+                    state,
+                    GrantState::Revoked | GrantState::RevokedUnloaded
+                ),
+                helpers,
+            },
+        );
+
+        let _ = self.grants_tx.send(GrantEvent::Assigned {
+            id,
+            shard,
+            ownership,
+        });
+    }
+
+    fn on_promote(&mut self, g: pb::Grant) {
+        let id = GrantId(g.id.clone());
+        if let Some(entry) = self.grants.get_mut(&id) {
+            entry.pb_grant = g;
+            entry.ownership.activate();
+        } else {
+            warn!(id = %id, "Promote for unknown grant");
+        }
+    }
+
+    fn on_revoke(&mut self, g: pb::Grant) {
+        let id = GrantId(g.id.clone());
+        let new_expiration = g.lease.as_ref().map(timestamp_to_system_time);
+        if let Some(entry) = self.grants.get_mut(&id) {
+            entry.revoked = true;
+            entry.pb_grant = g;
+            if let Some(exp) = new_expiration {
+                entry.ownership.set_expiration(exp);
+            }
+            entry.ownership.revoke();
+        } else {
+            warn!(id = %id, "Revoke for unknown grant");
+        }
+    }
+
+    fn on_notify(&mut self, n: client_message::Notify) {
+        let Some(target) = n.target else { return };
+        let Some(update) = n.update else { return };
+        let id = GrantId(target.id);
+        let update_state = grant_state_from_i32(update.state);
+        let Some(entry) = self.grants.get(&id) else {
+            debug!(id = %id, "Notify for unknown grant, ignoring");
+            return;
+        };
+        match update_state {
+            // Counterpart now loaded → let our unloader proceed.
+            GrantState::AllocatedLoaded => entry.ownership.counterpart_loaded(),
+            // Counterpart now unloaded → let our loader proceed.
+            GrantState::RevokedUnloaded => entry.ownership.counterpart_unloaded(),
+            other => warn!(?other, "Notify with unexpected update state"),
+        }
+    }
+
+    fn on_extend(&mut self, e: client_message::Extend) {
+        let Some(new_lease) = e.lease.as_ref().map(timestamp_to_system_time) else {
+            return;
+        };
+        for entry in self.grants.values() {
+            if !entry.revoked {
+                entry.ownership.set_expiration(new_lease);
+            }
+        }
+    }
+
+    fn remove_grant(&mut self, id: GrantId) {
+        if let Some(entry) = self.grants.remove(&id) {
+            entry.ownership.expire();
+            for h in entry.helpers {
+                h.abort();
+            }
+            let _ = self.grants_tx.send(GrantEvent::Removed { id });
+        }
     }
 }
+
+// ---------- Per-grant watcher tasks ----------
+
+fn spawn_load_watcher(
+    ownership: Arc<Ownership>,
+    grant: pb::Grant,
+    outbound: mpsc::Sender<JoinMessage>,
+) -> TaskHandle<()> {
+    tokio::spawn(async move {
+        let load = ownership.loader.load.reader();
+        let expired = ownership.expired.reader();
+        tokio::select! {
+            _ = load.closed() => {
+                let updated = pb::Grant {
+                    state: pb::GrantState::AllocatedLoaded as i32,
+                    ..grant
+                };
+                let _ = outbound
+                    .send(wrap_client(client_message::Msg::Update(client_message::Update {
+                        grant: Some(updated),
+                    })))
+                    .await;
+            }
+            _ = expired.closed() => {}
+        }
+    })
+}
+
+fn spawn_unload_watcher(
+    ownership: Arc<Ownership>,
+    grant: pb::Grant,
+    outbound: mpsc::Sender<JoinMessage>,
+) -> TaskHandle<()> {
+    tokio::spawn(async move {
+        let unload = ownership.unloader.unload.reader();
+        let expired = ownership.expired.reader();
+        tokio::select! {
+            _ = unload.closed() => {
+                let updated = pb::Grant {
+                    state: pb::GrantState::RevokedUnloaded as i32,
+                    ..grant
+                };
+                let _ = outbound
+                    .send(wrap_client(client_message::Msg::Update(client_message::Update {
+                        grant: Some(updated),
+                    })))
+                    .await;
+            }
+            _ = expired.closed() => {}
+        }
+    })
+}
+
+fn spawn_request_revoke_watcher(
+    ownership: Arc<Ownership>,
+    grant: pb::Grant,
+    outbound: mpsc::Sender<JoinMessage>,
+) -> TaskHandle<()> {
+    tokio::spawn(async move {
+        let requested = ownership.request_revoke_signal.reader();
+        let expired = ownership.expired.reader();
+        tokio::select! {
+            _ = requested.closed() => {
+                let _ = outbound
+                    .send(wrap_client(client_message::Msg::Revoke(client_message::Revoke {
+                        grants: vec![grant],
+                    })))
+                    .await;
+            }
+            _ = expired.closed() => {}
+        }
+    })
+}
+
+fn spawn_expiration_timer(ownership: Arc<Ownership>) -> TaskHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if ownership.expired.is_closed() {
+                return;
+            }
+            let deadline = ownership.expiration();
+            let now = SystemTime::now();
+            let sleep_for = deadline.duration_since(now).unwrap_or(Duration::ZERO);
+
+            if sleep_for.is_zero() {
+                ownership.expire();
+                return;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_for) => {
+                    // Re-check under the current expiration, which may have been extended.
+                    let deadline = ownership.expiration();
+                    if SystemTime::now() >= deadline {
+                        ownership.expire();
+                        return;
+                    }
+                }
+                _ = ownership.expiration_changed.notified() => {
+                    // Loop around and sleep for the new duration.
+                }
+            }
+        }
+    })
+}
+
+// ---------- Outbound message builders ----------
 
 fn build_register(
     consumer: Instance,
@@ -305,12 +542,6 @@ fn build_register(
     wrap_client(pb::client_message::Msg::Register(register))
 }
 
-fn build_deregister() -> JoinMessage {
-    wrap_client(pb::client_message::Msg::Deregister(
-        pb::client_message::Deregister {},
-    ))
-}
-
 fn wrap_client(msg: pb::client_message::Msg) -> JoinMessage {
     JoinMessage {
         msg: Some(join_message::Msg::Consumer(ConsumerMessage {
@@ -318,5 +549,18 @@ fn wrap_client(msg: pb::client_message::Msg) -> JoinMessage {
                 msg: Some(msg),
             })),
         })),
+    }
+}
+
+/// Public test helper: construct a `pb::Grant` from its domain parts. Used by
+/// integration tests and examples that want to fabricate messages for the
+/// mock server path.
+pub fn grant_pb(id: &str, shard: Shard, state: GrantState, lease: SystemTime) -> pb::Grant {
+    pb::Grant {
+        id: id.to_string(),
+        shard: Some(shard.into()),
+        state: pb::GrantState::from(state) as i32,
+        lease: Some(system_time_to_timestamp(lease)),
+        assigned: Some(system_time_to_timestamp(SystemTime::now())),
     }
 }

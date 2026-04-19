@@ -1,8 +1,4 @@
 //! Rust client for splitter data plane.
-//!
-//! Phase 1 surface: Latch, ClientError, domain IDs, session driver, ClusterMap,
-//! ConsumerClient::join. The Dispatcher/Processor/Proxy layers land in later
-//! phases.
 
 // ClientError carries a tonic::Status which is ~176 bytes; boxing it would
 // complicate the #[from] conversions without real benefit. Results carrying
@@ -12,16 +8,20 @@
 pub mod cluster;
 pub mod consumer;
 pub mod error;
+pub mod grant_map;
 pub mod ids;
 pub mod latch;
+pub mod ownership;
 pub mod session;
 pub mod wrap;
 
 pub use cluster::{ClusterId, ClusterMap, ConsumerEntry, GrantEntry};
-pub use consumer::{ClientMessageEvent, ConsumerClient, ConsumerOptions, JoinHandle};
+pub use consumer::{ConsumerClient, ConsumerOptions, GrantEvent, JoinHandle};
 pub use error::{ClientError, Result};
+pub use grant_map::GrantMap;
 pub use ids::{
-    ConsumerId, DomainKey, GrantId, Instance, InstanceId, Location, QualifiedDomainKey,
-    QualifiedDomainName, QualifiedServiceName, Shard,
+    ConsumerId, DomainKey, DomainKeyName, DomainType, GrantId, GrantState, Instance, InstanceId,
+    Location, QualifiedDomainKey, QualifiedDomainName, QualifiedServiceName, Shard,
 };
 pub use latch::{Latch, LatchReader};
+pub use ownership::{Loader, Ownership, Unloader};
