@@ -3,3 +3,5 @@
 .ijwb
 bazel-*
 MODULE.bazel.lock
+.claude/
+rust/target/
